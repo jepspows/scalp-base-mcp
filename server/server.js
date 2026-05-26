@@ -57,6 +57,17 @@ function candleVolumeAvg() {
   return window.reduce((s, c) => s + c.volume, 0) / window.length;
 }
 
+// Update VWAP + indicators without checking for signals
+function updateIndicators() {
+  vwap = calcVWAP();
+  const hl = calcRecentHL();
+  recentHigh = hl.high;
+  recentLow = hl.low;
+  const avgVol = candleVolumeAvg();
+  const last = candles.length > 0 ? candles[candles.length - 1] : null;
+  volumeAlert = avgVol > 0 && last ? last.volume / avgVol : 1;
+}
+
 // ─── Signal Engine ───────────────────────────────────────────────────────────
 
 function checkSignals() {
@@ -230,6 +241,8 @@ async function fetchCandles() {
       candles = newCandles.slice(-MAX_CANDLES);
       lastCandleTime = candles.length > 0 ? candles[candles.length - 1].time : 0;
       initialLoadDone = true;
+      // Compute indicators for the price endpoint
+      updateIndicators();
       return;
     }
     
@@ -249,6 +262,9 @@ async function fetchCandles() {
         if (signal && global.onNewSignal) global.onNewSignal(signal);
       }
     }
+    
+    // Update indicators for price endpoint
+    updateIndicators();
 
     // Also update trailing on the latest price even if no new candle
     if (freshCandles.length === 0 && newCandles.length > 0) {
