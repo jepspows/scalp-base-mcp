@@ -192,6 +192,7 @@ function closeSignal(reason, price) {
 
   currentSignal = null;
   return closed;
+}
 let lastCandleTime = 0;      // track last candle time for incremental updates
 
 // ─── Binance REST API Polling ─────────────────────────────────────────────────
@@ -434,4 +435,3 @@ app.listen(PORT, () => {
   console.log('Polling Kraken API (15m candles, 30s intervals)...');
   pollLoop();
 });
-}
