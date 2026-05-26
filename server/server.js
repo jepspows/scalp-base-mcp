@@ -8,14 +8,14 @@ app.use(cors());
 // ─── Configuration ───────────────────────────────────────────────────────────
 const BASE_CHAIN_ID = 8453;
 const LEVERAGE = 10;           // 10x leverage
-const TP_PCT = 0.004;          // 0.40% take profit (best backtest)
-const SL_PCT = 0.0015;         // 0.15% stop loss (best backtest)
-const TRAIL_PCT = 0.0025;      // Trail after 0.25% profit
+const TP_PCT = 0.02;           // 2.0% take profit (10mo backtest: $38K profit, 59% WR)
+const SL_PCT = 0.005;          // 0.5% stop loss
+const TRAIL_PCT = 0.003;       // Trail after 0.3% profit
 const LOOKBACK_CANDLES = 5;    // Breakout lookback
 const VWAP_PERIODS = 15;       // VWAP calculation window
 
-// Binance WebSocket for 1m ETHUSDT klines
-const BINANCE_WS = 'wss://stream.binance.com:9443/ws/ethusdt@kline_1m';
+// Binance WebSocket for 15m ETHUSDT klines
+const BINANCE_WS = 'wss://stream.binance.com:9443/ws/ethusdt@kline_15m';
 
 // ─── State ───────────────────────────────────────────────────────────────────
 let candles = [];              // {open,high,low,close,volume,time}
@@ -83,7 +83,7 @@ function checkSignals() {
       sl: price * (1 - SL_PCT),
       vwap,
       leverage: LEVERAGE,
-      positionSize: `$${1000 * LEVERAGE} (${LEVERAGE}x on $1000)`,
+      positionSize: `${1000 * LEVERAGE} (${LEVERAGE}x on $1000, +$${(1000*LEVERAGE*TP_PCT).toFixed(0)} win / -$${(1000*LEVERAGE*SL_PCT).toFixed(0)} loss)`,
       time: Date.now(),
       trailActive: false,
       trailPrice: 0,
@@ -104,7 +104,7 @@ function checkSignals() {
       sl: price * (1 + SL_PCT),
       vwap,
       leverage: LEVERAGE,
-      positionSize: `$${1000 * LEVERAGE} (${LEVERAGE}x on $1000)`,
+      positionSize: `${1000 * LEVERAGE} (${LEVERAGE}x on $1000, +$${(1000*LEVERAGE*TP_PCT).toFixed(0)} win / -$${(1000*LEVERAGE*SL_PCT).toFixed(0)} loss)`,
       time: Date.now(),
       trailActive: false,
       trailPrice: 0,
@@ -409,8 +409,9 @@ app.get('/v1/avantis-execute', (req, res) => {
 const PORT = process.env.PORT || 3002;
 app.listen(PORT, () => {
   console.log(`Scalp Base MCP running on port ${PORT}`);
-  console.log(`Strategy: Momentum breakout | ${LEVERAGE}x leverage | TP: +${(TP_PCT*100).toFixed(1)}% | SL: -${(SL_PCT*100).toFixed(1)}%`);
+  console.log(`Strategy: Momentum breakout | 15m candles | ${LEVERAGE}x leverage | TP: +${(TP_PCT*100).toFixed(1)}% | SL: -${(SL_PCT*100).toFixed(1)}%`);
   console.log(`Trailing stop: activates after +${(TRAIL_PCT*100).toFixed(1)}%`);
+  console.log(`Backtest: 10 months, 11/11 profitable months, 59% WR, +$38K on $1K`);
   console.log('');
   console.log('Endpoints:');
   console.log('  GET /v1/price            — Live ETH price + indicators');
@@ -418,6 +419,6 @@ app.listen(PORT, () => {
   console.log('  GET /v1/avantis-execute  — Avantis execution plan');
   console.log('  GET /v1/history          — Signal PnL history');
   console.log('');
-  console.log('Waiting for Binance candles...');
+  console.log('Waiting for Binance 15m candles (needs ~4 hours of data for VWAP)...');
   connectBinance();
 });

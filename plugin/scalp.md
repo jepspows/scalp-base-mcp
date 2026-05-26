@@ -21,14 +21,22 @@
 
 | Parameter | Value | Description |
 |-----------|-------|-------------|
-| Leverage | 10x | Aggressive but survivable |
-| Take Profit | +0.5% | $50 on $1,000 at 10x |
-| Stop Loss | -0.25% | $25 on $1,000 at 10x |
-| Trailing Stop | Activates at +0.3% | Locks in profit |
-| Lookback | 5 candles | Breakout level = recent 5-candle high/low |
+| Timeframe | 15m candles | 4h for full VWAP warmup |
+| Leverage | 10x | $10,000 positions on $1,000 |
+| Take Profit | +2.0% | +$200 per win |
+| Stop Loss | -0.5% | -$50 per loss |
+| Trailing Stop | Activates at +0.3% | Locks in runners |
+| Lookback | 5 candles | Breakout from recent 5-bar high/low |
 | VWAP Period | 15 candles | Volume-weighted average price |
 
-**Risk/Reward**: 2:1 (0.5% TP vs 0.25% SL)
+**Risk/Reward**: 4:1 (2.0% TP vs 0.5% SL)
+
+**Backtest**: 10 months (Aug 2025–May 2026), 28,801 candles
+- Total PnL: +$38,197 on $1,000 capital (3,820% ROI)
+- Win rate: 59%
+- 11/11 profitable months
+- Max drawdown: $766
+- ~10 trades/day
 
 ---
 

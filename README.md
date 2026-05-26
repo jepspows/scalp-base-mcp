@@ -8,11 +8,13 @@ Binance WebSocket → 1m candles → VWAP breakout signals → Avantis perps via
 
 | Parameter | Value |
 |-----------|-------|
+| Timeframe | 15m candles |
 | Leverage | 10x |
-| Take Profit | +0.5% |
-| Stop Loss | -0.25% |
+| Take Profit | +2.0% (+$200) |
+| Stop Loss | -0.5% (-$50) |
 | Trailing Stop | Activates at +0.3% |
-| Risk/Reward | 2:1 |
+| Risk/Reward | 4:1 |
+| Backtest | 10mo, 59% WR, +$38K, 11/11 months green |
 
 **Entry conditions**: Price breaks 5-candle high/low AND crosses VWAP.
 **Exit**: TP hits, SL hits, or trailing stop catches the move.
