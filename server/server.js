@@ -13,8 +13,8 @@ const TRAIL_PCT = 0.003;       // Trail after 0.3% profit
 const LOOKBACK_CANDLES = 5;    // Breakout lookback
 const VWAP_PERIODS = 15;       // VWAP calculation window
 
-// Binance REST API for 15m ETHUSDT klines (fallback from WebSocket)
-const BINANCE_API = 'https://api.binance.com/api/v3/klines?symbol=ETHUSDT&interval=15m';
+// Kraken REST API for 15m ETH/USD klines (Binance geo-blocked)
+const KRAKEN_API = 'https://api.kraken.com/0/public/OHLC?pair=ETHUSD&interval=15';
 
 // ─── State ───────────────────────────────────────────────────────────────────
 let candles = [];              // {open,high,low,close,volume,time}
@@ -198,8 +198,12 @@ function closeSignal(reason, price) {
 
 async function fetchCandles() {
   try {
-    const res = await fetch(BINANCE_API + '&limit=50');
-    const raw = await res.json();
+    const res = await fetch(KRAKEN_API);
+    const data = await res.json();
+    if (!data.result || data.error?.length > 0) return;
+    
+    // Kraken returns: [time, open, high, low, close, vwap, volume, count]
+    const raw = data.result.XETHZUSD;
     if (!Array.isArray(raw)) return;
     
     const newCandles = raw.map(k => ({
@@ -207,9 +211,9 @@ async function fetchCandles() {
       high: parseFloat(k[2]),
       low: parseFloat(k[3]),
       close: parseFloat(k[4]),
-      volume: parseFloat(k[5]),
-      time: k[0],
-      isClosed: k[6] > Date.now() - 900000, // 15 min in ms
+      volume: parseFloat(k[6]),
+      time: k[0] * 1000, // Kraken uses seconds
+      isClosed: (k[0] * 1000) < Date.now() - 900000, // older than 15 min = closed
     }));
     
     // Update candle array, merging with existing
@@ -404,6 +408,6 @@ app.listen(PORT, () => {
   console.log('  GET /v1/avantis-execute  — Avantis execution plan');
   console.log('  GET /v1/history          — Signal PnL history');
   console.log('');
-  console.log('Waiting for Binance REST API (15m candles, 30s poll)...');
+  console.log('Polling Kraken API (15m candles, 30s intervals)...');
   pollLoop();
 });
