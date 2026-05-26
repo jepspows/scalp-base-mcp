@@ -1,0 +1,14 @@
+services:
+  - type: web
+    name: scalp-base-mcp
+    env: node
+    region: oregon
+    buildCommand: cd server && npm install
+    startCommand: cd server && node server.js
+    plan: free
+    autoDeploy: true
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: "3002"
