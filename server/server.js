@@ -192,14 +192,16 @@ function closeSignal(reason, price) {
 
   currentSignal = null;
   return closed;
-}
+let lastCandleTime = 0;      // track last candle time for incremental updates
 
 // ─── Binance REST API Polling ─────────────────────────────────────────────────
+
+let initialLoadDone = false;
 
 async function fetchCandles() {
   try {
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 15000); // 15s timeout
+    const timeout = setTimeout(() => controller.abort(), 15000);
     
     const res = await fetch(KRAKEN_API, { signal: controller.signal });
     clearTimeout(timeout);
@@ -210,7 +212,6 @@ async function fetchCandles() {
       return;
     }
     
-    // Kraken returns: [time, open, high, low, close, vwap, volume, count]
     const raw = data.result.XETHZUSD;
     if (!Array.isArray(raw)) return;
     
@@ -220,32 +221,37 @@ async function fetchCandles() {
       low: parseFloat(k[3]),
       close: parseFloat(k[4]),
       volume: parseFloat(k[6]),
-      time: k[0] * 1000, // Kraken uses seconds
-      isClosed: (k[0] * 1000) < Date.now() - 900000, // older than 15 min = closed
-    }));
+      time: k[0] * 1000,
+    })).sort((a, b) => a.time - b.time);
     
-    // Update candle array, merging with existing
-    for (const nc of newCandles) {
-      const existingIdx = candles.findIndex(c => c.time === nc.time);
-      if (existingIdx >= 0) {
-        candles[existingIdx] = nc;
-      } else {
-        candles.push(nc);
-        if (candles.length > MAX_CANDLES) candles.shift();
-        // New closed candle — check for signals
-        if (nc.isClosed) {
-          const closed = updateTrailingStop(nc.close);
-          if (closed && global.onSignalClose) global.onSignalClose(closed);
-          if (!currentSignal) {
-            const signal = checkSignals();
-            if (signal && global.onNewSignal) global.onNewSignal(signal);
-          }
-        }
+    // On initial load: just populate candles, no signal checks
+    if (!initialLoadDone) {
+      candles = newCandles.slice(-MAX_CANDLES);
+      lastCandleTime = candles.length > 0 ? candles[candles.length - 1].time : 0;
+      initialLoadDone = true;
+      return;
+    }
+    
+    // On subsequent polls: only process candles newer than lastCandleTime
+    const freshCandles = newCandles.filter(c => c.time > lastCandleTime);
+    
+    for (const nc of freshCandles) {
+      candles.push(nc);
+      if (candles.length > MAX_CANDLES) candles.shift();
+      lastCandleTime = nc.time;
+      
+      // Check for signal on each new closed candle
+      const closed = updateTrailingStop(nc.close);
+      if (closed && global.onSignalClose) global.onSignalClose(closed);
+      if (!currentSignal) {
+        const signal = checkSignals();
+        if (signal && global.onNewSignal) global.onNewSignal(signal);
       }
     }
-    // Always update trailing on latest price
-    if (newCandles.length > 0) {
-      updateTrailingStop(newCandles[newCandles.length-1].close);
+
+    // Also update trailing on the latest price even if no new candle
+    if (freshCandles.length === 0 && newCandles.length > 0) {
+      updateTrailingStop(newCandles[newCandles.length - 1].close);
     }
   } catch (e) {
     if (e.name === 'AbortError') {
@@ -428,3 +434,4 @@ app.listen(PORT, () => {
   console.log('Polling Kraken API (15m candles, 30s intervals)...');
   pollLoop();
 });
+}
