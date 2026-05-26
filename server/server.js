@@ -7,11 +7,10 @@ app.use(cors());
 
 // ─── Configuration ───────────────────────────────────────────────────────────
 const BASE_CHAIN_ID = 8453;
-const LEVERAGE = 10;           // 10x leverage (aggressive but survivable)
-const TP_PCT = 0.005;          // 0.5% take profit
-const SL_PCT = 0.0025;         // 0.25% stop loss
-const TRAIL_PCT = 0.003;       // Trail after 0.3% profit
-const MIN_VOLUME_1M = 50;      // Minimum 1m candle volume in ETH
+const LEVERAGE = 10;           // 10x leverage
+const TP_PCT = 0.004;          // 0.40% take profit (best backtest)
+const SL_PCT = 0.0015;         // 0.15% stop loss (best backtest)
+const TRAIL_PCT = 0.0025;      // Trail after 0.25% profit
 const LOOKBACK_CANDLES = 5;    // Breakout lookback
 const VWAP_PERIODS = 15;       // VWAP calculation window
 
