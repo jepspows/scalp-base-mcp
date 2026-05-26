@@ -226,25 +226,26 @@ async function fetchCandles() {
     
     // Update candle array, merging with existing
     for (const nc of newCandles) {
-      const existing = candles.findIndex(c => c.time === nc.time);
-      if (existing >= 0) {
-        const wasClosed = candles[existing].isClosed;
-        candles[existing] = nc;
-        // If just closed, check signals
-        if (!wasClosed && nc.isClosed) {
+      const existingIdx = candles.findIndex(c => c.time === nc.time);
+      if (existingIdx >= 0) {
+        candles[existingIdx] = nc;
+      } else {
+        candles.push(nc);
+        if (candles.length > MAX_CANDLES) candles.shift();
+        // New closed candle — check for signals
+        if (nc.isClosed) {
           const closed = updateTrailingStop(nc.close);
           if (closed && global.onSignalClose) global.onSignalClose(closed);
           if (!currentSignal) {
             const signal = checkSignals();
             if (signal && global.onNewSignal) global.onNewSignal(signal);
           }
-        } else {
-          updateTrailingStop(nc.close);
         }
-      } else {
-        candles.push(nc);
-        if (candles.length > MAX_CANDLES) candles.shift();
       }
+    }
+    // Always update trailing on latest price
+    if (newCandles.length > 0) {
+      updateTrailingStop(newCandles[newCandles.length-1].close);
     }
   } catch (e) {
     if (e.name === 'AbortError') {
