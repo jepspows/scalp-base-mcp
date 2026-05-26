@@ -198,9 +198,17 @@ function closeSignal(reason, price) {
 
 async function fetchCandles() {
   try {
-    const res = await fetch(KRAKEN_API);
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 15000); // 15s timeout
+    
+    const res = await fetch(KRAKEN_API, { signal: controller.signal });
+    clearTimeout(timeout);
+    
     const data = await res.json();
-    if (!data.result || data.error?.length > 0) return;
+    if (!data.result || data.error?.length > 0) {
+      console.error('Kraken API error:', JSON.stringify(data.error));
+      return;
+    }
     
     // Kraken returns: [time, open, high, low, close, vwap, volume, count]
     const raw = data.result.XETHZUSD;
@@ -239,14 +247,22 @@ async function fetchCandles() {
       }
     }
   } catch (e) {
-    console.error('Binance API error:', e.message);
+    if (e.name === 'AbortError') {
+      console.error('Kraken API timeout (15s)');
+    } else {
+      console.error('Kraken API error:', e.message);
+    }
   }
 }
 
 async function pollLoop() {
+  console.log('First poll starting...');
+  await fetchCandles();
+  console.log('Initial candles loaded: ' + candles.length);
   while (true) {
+    await new Promise(r => setTimeout(r, 30000));
+    process.stdout.write('.');
     await fetchCandles();
-    await new Promise(r => setTimeout(r, 30000)); // 30s poll
   }
 }
 
