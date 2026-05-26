@@ -1,6 +1,5 @@
 const express = require('express');
 const cors = require('cors');
-const WebSocket = require('ws');
 
 const app = express();
 app.use(cors());
@@ -14,8 +13,8 @@ const TRAIL_PCT = 0.003;       // Trail after 0.3% profit
 const LOOKBACK_CANDLES = 5;    // Breakout lookback
 const VWAP_PERIODS = 15;       // VWAP calculation window
 
-// Binance WebSocket for 15m ETHUSDT klines
-const BINANCE_WS = 'wss://stream.binance.com:9443/ws/ethusdt@kline_15m';
+// Binance REST API for 15m ETHUSDT klines (fallback from WebSocket)
+const BINANCE_API = 'https://api.binance.com/api/v3/klines?symbol=ETHUSDT&interval=15m';
 
 // ─── State ───────────────────────────────────────────────────────────────────
 let candles = [];              // {open,high,low,close,volume,time}
@@ -195,70 +194,56 @@ function closeSignal(reason, price) {
   return closed;
 }
 
-// ─── Binance WebSocket ───────────────────────────────────────────────────────
+// ─── Binance REST API Polling ─────────────────────────────────────────────────
 
-function connectBinance() {
-  const ws = new WebSocket(BINANCE_WS);
-
-  ws.on('open', () => {
-    console.log('Connected to Binance WebSocket (ETH/USDT 1m klines)');
-  });
-
-  ws.on('message', (data) => {
-    try {
-      const msg = JSON.parse(data.toString());
-      if (!msg.k) return;
-
-      const k = msg.k;
-      const candle = {
-        open: parseFloat(k.o),
-        high: parseFloat(k.h),
-        low: parseFloat(k.l),
-        close: parseFloat(k.c),
-        volume: parseFloat(k.v),
-        time: k.t,
-        isClosed: k.x,
-      };
-
-      // Update or add candle
-      if (candles.length > 0 && candles[candles.length - 1].time === candle.time) {
-        candles[candles.length - 1] = candle;
-      } else {
-        candles.push(candle);
-        if (candles.length > MAX_CANDLES) candles.shift();
-      }
-
-      // Only check signals on candle close
-      if (k.x) {
-        // Update trailing stop first (on every close)
-        const closed = updateTrailingStop(candle.close);
-        if (closed && global.onSignalClose) global.onSignalClose(closed);
-
-        // Check for new signals
-        if (!currentSignal) {
-          const signal = checkSignals();
-          if (signal && global.onNewSignal) global.onNewSignal(signal);
+async function fetchCandles() {
+  try {
+    const res = await fetch(BINANCE_API + '&limit=50');
+    const raw = await res.json();
+    if (!Array.isArray(raw)) return;
+    
+    const newCandles = raw.map(k => ({
+      open: parseFloat(k[1]),
+      high: parseFloat(k[2]),
+      low: parseFloat(k[3]),
+      close: parseFloat(k[4]),
+      volume: parseFloat(k[5]),
+      time: k[0],
+      isClosed: k[6] > Date.now() - 900000, // 15 min in ms
+    }));
+    
+    // Update candle array, merging with existing
+    for (const nc of newCandles) {
+      const existing = candles.findIndex(c => c.time === nc.time);
+      if (existing >= 0) {
+        const wasClosed = candles[existing].isClosed;
+        candles[existing] = nc;
+        // If just closed, check signals
+        if (!wasClosed && nc.isClosed) {
+          const closed = updateTrailingStop(nc.close);
+          if (closed && global.onSignalClose) global.onSignalClose(closed);
+          if (!currentSignal) {
+            const signal = checkSignals();
+            if (signal && global.onNewSignal) global.onNewSignal(signal);
+          }
+        } else {
+          updateTrailingStop(nc.close);
         }
       } else {
-        // Even on partial candles, check TP/SL
-        const closed = updateTrailingStop(candle.close);
-        if (closed && global.onSignalClose) global.onSignalClose(closed);
+        candles.push(nc);
+        if (candles.length > MAX_CANDLES) candles.shift();
       }
-    } catch (e) {
-      // parse error
     }
-  });
+  } catch (e) {
+    console.error('Binance API error:', e.message);
+  }
+}
 
-  ws.on('close', () => {
-    console.log('Binance WS disconnected. Reconnecting in 5s...');
-    setTimeout(connectBinance, 5000);
-  });
-
-  ws.on('error', (err) => {
-    console.error('Binance WS error:', err.message);
-  });
-
-  return ws;
+async function pollLoop() {
+  while (true) {
+    await fetchCandles();
+    await new Promise(r => setTimeout(r, 30000)); // 30s poll
+  }
 }
 
 // ─── Callbacks ───────────────────────────────────────────────────────────────
@@ -419,6 +404,6 @@ app.listen(PORT, () => {
   console.log('  GET /v1/avantis-execute  — Avantis execution plan');
   console.log('  GET /v1/history          — Signal PnL history');
   console.log('');
-  console.log('Waiting for Binance 15m candles (needs ~4 hours of data for VWAP)...');
-  connectBinance();
+  console.log('Waiting for Binance REST API (15m candles, 30s poll)...');
+  pollLoop();
 });
