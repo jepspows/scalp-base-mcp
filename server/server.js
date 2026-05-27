@@ -4,31 +4,61 @@ const cors = require('cors');
 const app = express();
 app.use(cors());
 
-// ─── Configuration ───────────────────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════════════════════
+// STRATEGY CONFIGURATION
+// ═══════════════════════════════════════════════════════════════════════════════
 const BASE_CHAIN_ID = 8453;
-const LEVERAGE = 10;           // 10x leverage
-const TP_PCT = 0.02;           // 2.0% take profit (10mo backtest: $38K profit, 59% WR)
-const SL_PCT = 0.005;          // 0.5% stop loss
-const TRAIL_PCT = 0.003;       // Trail after 0.3% profit
-const LOOKBACK_CANDLES = 5;    // Breakout lookback
-const VWAP_PERIODS = 15;       // VWAP calculation window
+const LEVERAGE = 10;
 
-// Kraken REST API for 15m ETH/USD klines (Binance geo-blocked)
+// Entry / exit thresholds
+const TP_PCT        = 0.025;   // Take profit: +2.5% price move (+$250 on $1K/10x)
+const SL_PCT        = 0.008;   // Stop loss:   -0.8% price move (-$80 on $1K/10x)
+const TRAIL_PCT     = 0.012;   // Trail activates after +1.2%
+const TRAIL_BUFFER  = 0.004;   // Trail closes at peak -0.4% (was 0.1% — noise)
+const BE_PCT        = 0.010;   // Move SL to breakeven after +1.0%
+
+// Signal filters
+const LOOKBACK_CANDLES   = 5;
+const VWAP_PERIODS       = 15;
+const EMA_PERIOD         = 20;    // Trend: LONG only above EMA20, SHORT only below
+const ATR_PERIOD         = 14;    // Dynamic SL floor
+const ATR_SL_MULT        = 1.5;   // SL floor = ATR × 1.5
+const VOLUME_MIN_RATIO   = 1.3;   // Require ≥1.3× avg volume for entry
+
+// Risk management
+const COOLDOWN_LOSS_MS   = 45 * 60 * 1000;  // 45 min after loss
+const COOLDOWN_WIN_MS    = 15 * 60 * 1000;  // 15 min after win
+const TIME_STOP_CANDLES  = 12;              // Exit after 12 candles (3h)
+const MAX_DAILY_LOSS     = 300;             // Stop for the day after -$300
+
+// Data source
 const KRAKEN_API = 'https://api.kraken.com/0/public/OHLC?pair=ETHUSD&interval=15';
 
-// ─── State ───────────────────────────────────────────────────────────────────
-let candles = [];              // {open,high,low,close,volume,time}
-let currentSignal = null;      // active signal {type,entry,tp,sl,time,trailActive}
-let signalHistory = [];        // past signals for backtesting
-let vwap = 0;
-let recentHigh = 0;
-let recentLow = Infinity;
-let volumeAlert = 0;
+// ═══════════════════════════════════════════════════════════════════════════════
+// STATE
+// ═══════════════════════════════════════════════════════════════════════════════
+let candles        = [];   // {open,high,low,close,volume,time}
+let currentSignal  = null; // active signal
+let signalHistory  = [];   // closed + active signals
+let vwap           = 0;
+let ema            = 0;
+let atr            = 0;
+let recentHigh     = 0;
+let recentLow      = Infinity;
+let volumeAlert    = 0;
 
-const MAX_CANDLES = 200;
-const MAX_HISTORY = 200;
+// Cooldown / daily loss
+let lastCloseTime  = 0;
+let lastCloseWasLoss = false;
+let dailyPnl       = 0;
+let dailyDate      = '';
 
-// ─── Calculations ────────────────────────────────────────────────────────────
+const MAX_CANDLES  = 200;
+const MAX_HISTORY  = 500;
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// CALCULATIONS
+// ═══════════════════════════════════════════════════════════════════════════════
 
 function calcVWAP() {
   const window = candles.slice(-VWAP_PERIODS);
@@ -42,8 +72,37 @@ function calcVWAP() {
   return cumulativeVol > 0 ? cumulativePV / cumulativeVol : 0;
 }
 
+function calcEMA(period) {
+  if (candles.length < period) return candles.length > 0 ? candles[candles.length - 1].close : 0;
+  const k = 2 / (period + 1);
+  let emaVal = candles.slice(0, period).reduce((s, c) => s + c.close, 0) / period; // SMA seed
+  for (let i = period; i < candles.length; i++) {
+    emaVal = candles[i].close * k + emaVal * (1 - k);
+  }
+  return emaVal;
+}
+
+function calcATR(period) {
+  if (candles.length < period + 1) {
+    // Fallback: use SL_PCT-based value
+    return candles.length > 0 ? candles[candles.length - 1].close * SL_PCT : 0;
+  }
+  let trSum = 0;
+  for (let i = candles.length - period; i < candles.length; i++) {
+    const c = candles[i];
+    const prev = candles[i - 1];
+    const tr = Math.max(
+      c.high - c.low,
+      Math.abs(c.high - prev.close),
+      Math.abs(c.low - prev.close)
+    );
+    trSum += tr;
+  }
+  return trSum / period;
+}
+
 function calcRecentHL() {
-  const window = candles.slice(-LOOKBACK_CANDLES - 1, -1); // exclude current forming candle
+  const window = candles.slice(-LOOKBACK_CANDLES - 1, -1); // exclude current candle
   if (window.length === 0) return { high: 0, low: Infinity };
   return {
     high: Math.max(...window.map(c => c.high)),
@@ -57,9 +116,10 @@ function candleVolumeAvg() {
   return window.reduce((s, c) => s + c.volume, 0) / window.length;
 }
 
-// Update VWAP + indicators without checking for signals
 function updateIndicators() {
   vwap = calcVWAP();
+  ema = calcEMA(EMA_PERIOD);
+  atr = calcATR(ATR_PERIOD);
   const hl = calcRecentHL();
   recentHigh = hl.high;
   recentLow = hl.low;
@@ -68,15 +128,39 @@ function updateIndicators() {
   volumeAlert = avgVol > 0 && last ? last.volume / avgVol : 1;
 }
 
-// ─── Signal Engine ───────────────────────────────────────────────────────────
+function resetDailyPnl() {
+  const today = new Date().toISOString().slice(0, 10);
+  if (dailyDate !== today) {
+    dailyPnl = 0;
+    dailyDate = today;
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SIGNAL ENGINE
+// ═══════════════════════════════════════════════════════════════════════════════
 
 function checkSignals() {
-  if (candles.length < VWAP_PERIODS + 2) return null;
-  if (currentSignal) return null; // Only one signal at a time
+  if (candles.length < Math.max(VWAP_PERIODS, EMA_PERIOD, ATR_PERIOD) + 2) return null;
+  if (currentSignal) return null;
 
-  const price = candles[candles.length - 1].close;
+  // Daily loss circuit breaker
+  resetDailyPnl();
+  if (dailyPnl <= -MAX_DAILY_LOSS) return null;
+
+  // Cooldown after closed trade
+  if (lastCloseTime > 0) {
+    const cooldown = lastCloseWasLoss ? COOLDOWN_LOSS_MS : COOLDOWN_WIN_MS;
+    if (Date.now() - lastCloseTime < cooldown) return null;
+  }
+
+  const price     = candles[candles.length - 1].close;
   const prevPrice = candles[candles.length - 2].close;
+
+  // Refresh indicators
   vwap = calcVWAP();
+  ema = calcEMA(EMA_PERIOD);
+  atr = calcATR(ATR_PERIOD);
   const hl = calcRecentHL();
   recentHigh = hl.high;
   recentLow = hl.low;
@@ -84,19 +168,38 @@ function checkSignals() {
   const lastVol = candles[candles.length - 1].volume;
   volumeAlert = avgVol > 0 ? lastVol / avgVol : 1;
 
-  // LONG signal: price breaks above recent high AND above VWAP
-  if (price > recentHigh && price > vwap && prevPrice <= recentHigh) {
+  // Volume filter — skip low-volume breakouts
+  if (volumeAlert < VOLUME_MIN_RATIO) return null;
+
+  // Dynamic SL floor from ATR
+  const atrSl = atr * ATR_SL_MULT;
+  const priceSlPct = price * SL_PCT;
+  const effectiveSl = Math.max(atrSl, priceSlPct);
+
+  // ── LONG ──────────────────────────────────────────────────────────────
+  const brokeHigh  = price > recentHigh && prevPrice <= recentHigh;
+  const aboveVwap  = price > vwap;
+  const aboveEma   = price > ema;   // trend filter
+
+  if (brokeHigh && aboveVwap && aboveEma) {
+    const slPrice = price - effectiveSl;
     const signal = {
       type: 'LONG',
       entry: price,
       tp: price * (1 + TP_PCT),
-      sl: price * (1 - SL_PCT),
+      sl: slPrice,
+      slPctUsed: ((effectiveSl / price) * 100).toFixed(2),
       vwap,
+      ema,
+      atr,
       leverage: LEVERAGE,
-      positionSize: `${1000 * LEVERAGE} (${LEVERAGE}x on $1000, +$${(1000*LEVERAGE*TP_PCT).toFixed(0)} win / -$${(1000*LEVERAGE*SL_PCT).toFixed(0)} loss)`,
+      positionSize: `${1000 * LEVERAGE} (${LEVERAGE}x on $1000)` + 
+        ` | TP +$${(1000*LEVERAGE*TP_PCT).toFixed(0)} / SL -$${(1000*LEVERAGE*(effectiveSl/price)).toFixed(0)}`,
       time: Date.now(),
       trailActive: false,
       trailPrice: 0,
+      breakevenMoved: false,
+      entryCandleIndex: candles.length - 1,
       volumeRatio: volumeAlert,
     };
     currentSignal = signal;
@@ -105,19 +208,30 @@ function checkSignals() {
     return signal;
   }
 
-  // SHORT signal: price breaks below recent low AND below VWAP
-  if (price < recentLow && price < vwap && prevPrice >= recentLow) {
+  // ── SHORT ─────────────────────────────────────────────────────────────
+  const brokeLow   = price < recentLow && prevPrice >= recentLow;
+  const belowVwap  = price < vwap;
+  const belowEma   = price < ema;
+
+  if (brokeLow && belowVwap && belowEma) {
+    const slPrice = price + effectiveSl;
     const signal = {
       type: 'SHORT',
       entry: price,
       tp: price * (1 - TP_PCT),
-      sl: price * (1 + SL_PCT),
+      sl: slPrice,
+      slPctUsed: ((effectiveSl / price) * 100).toFixed(2),
       vwap,
+      ema,
+      atr,
       leverage: LEVERAGE,
-      positionSize: `${1000 * LEVERAGE} (${LEVERAGE}x on $1000, +$${(1000*LEVERAGE*TP_PCT).toFixed(0)} win / -$${(1000*LEVERAGE*SL_PCT).toFixed(0)} loss)`,
+      positionSize: `${1000 * LEVERAGE} (${LEVERAGE}x on $1000)` +
+        ` | TP +$${(1000*LEVERAGE*TP_PCT).toFixed(0)} / SL -$${(1000*LEVERAGE*(effectiveSl/price)).toFixed(0)}`,
       time: Date.now(),
       trailActive: false,
       trailPrice: 0,
+      breakevenMoved: false,
+      entryCandleIndex: candles.length - 1,
       volumeRatio: volumeAlert,
     };
     currentSignal = signal;
@@ -129,59 +243,89 @@ function checkSignals() {
   return null;
 }
 
+// ═══════════════════════════════════════════════════════════════════════════════
+// EXIT ENGINE
+// ═══════════════════════════════════════════════════════════════════════════════
+
 function updateTrailingStop(price) {
   if (!currentSignal) return null;
 
-  // Check if trailing should activate
+  const isLong = currentSignal.type === 'LONG';
+
+  // 1. Check TP first
+  if (isLong && price >= currentSignal.tp) return closeSignal('TP', price);
+  if (!isLong && price <= currentSignal.tp) return closeSignal('TP', price);
+
+  // 2. Move SL to breakeven after BE_PCT profit
+  if (!currentSignal.breakevenMoved) {
+    const beTrigger = isLong
+      ? price >= currentSignal.entry * (1 + BE_PCT)
+      : price <= currentSignal.entry * (1 - BE_PCT);
+    if (beTrigger) {
+      currentSignal.sl = currentSignal.entry;
+      currentSignal.breakevenMoved = true;
+    }
+  }
+
+  // 3. Activate trailing stop
   if (!currentSignal.trailActive) {
-    if (currentSignal.type === 'LONG' && price >= currentSignal.entry * (1 + TRAIL_PCT)) {
-      currentSignal.trailActive = true;
-      currentSignal.trailPrice = price;
-    }
-    if (currentSignal.type === 'SHORT' && price <= currentSignal.entry * (1 - TRAIL_PCT)) {
+    const trailTrigger = isLong
+      ? price >= currentSignal.entry * (1 + TRAIL_PCT)
+      : price <= currentSignal.entry * (1 - TRAIL_PCT);
+    if (trailTrigger) {
       currentSignal.trailActive = true;
       currentSignal.trailPrice = price;
     }
   }
 
-  // Update trailing price
+  // 4. Update trailing price (only moves in profit direction)
   if (currentSignal.trailActive) {
-    if (currentSignal.type === 'LONG' && price > currentSignal.trailPrice) {
+    if (isLong && price > currentSignal.trailPrice) {
       currentSignal.trailPrice = price;
     }
-    if (currentSignal.type === 'SHORT' && price < currentSignal.trailPrice) {
+    if (!isLong && price < currentSignal.trailPrice) {
       currentSignal.trailPrice = price;
     }
   }
 
-  // Check TP
-  if (currentSignal.type === 'LONG' && price >= currentSignal.tp) {
-    return closeSignal('TP', price);
-  }
-  if (currentSignal.type === 'SHORT' && price <= currentSignal.tp) {
-    return closeSignal('TP', price);
+  // 5. Effective stop level
+  let effectiveSL;
+  if (currentSignal.trailActive) {
+    effectiveSL = isLong
+      ? currentSignal.trailPrice * (1 - TRAIL_BUFFER)
+      : currentSignal.trailPrice * (1 + TRAIL_BUFFER);
+  } else {
+    effectiveSL = currentSignal.sl; // may have been moved to breakeven
   }
 
-  // Check SL (or trailing SL)
-  const effectiveSL = currentSignal.trailActive
-    ? (currentSignal.type === 'LONG'
-        ? currentSignal.trailPrice * (1 - 0.001) // 0.1% trail buffer
-        : currentSignal.trailPrice * (1 + 0.001))
-    : currentSignal.sl;
+  // Ensure trailing SL never worse than original SL
+  if (isLong) {
+    effectiveSL = Math.max(effectiveSL, currentSignal.sl);
+  } else {
+    effectiveSL = Math.min(effectiveSL, currentSignal.sl);
+  }
 
-  if (currentSignal.type === 'LONG' && price <= effectiveSL) {
+  // 6. Check SL hit
+  if (isLong && price <= effectiveSL) {
     return closeSignal(currentSignal.trailActive ? 'TRAILING_STOP' : 'STOP_LOSS', price);
   }
-  if (currentSignal.type === 'SHORT' && price >= effectiveSL) {
+  if (!isLong && price >= effectiveSL) {
     return closeSignal(currentSignal.trailActive ? 'TRAILING_STOP' : 'STOP_LOSS', price);
+  }
+
+  // 7. Time stop — exit if held too long
+  const candlesHeld = candles.length - currentSignal.entryCandleIndex;
+  if (candlesHeld >= TIME_STOP_CANDLES) {
+    return closeSignal('TIME_STOP', price);
   }
 
   return null;
 }
 
 function closeSignal(reason, price) {
+  const isLong = currentSignal.type === 'LONG';
   const entry = currentSignal.entry;
-  const pnlPct = currentSignal.type === 'LONG'
+  const pnlPct = isLong
     ? ((price - entry) / entry * 100)
     : ((entry - price) / entry * 100);
   const pnlUsd = (pnlPct / 100 * 1000 * LEVERAGE);
@@ -201,12 +345,23 @@ function closeSignal(reason, price) {
   const idx = signalHistory.findIndex(s => s.status === 'ACTIVE');
   if (idx >= 0) signalHistory[idx] = closed;
 
+  // Track for cooldown
+  lastCloseTime = Date.now();
+  lastCloseWasLoss = pnlUsd <= 0;
+
+  // Daily PnL tracking
+  resetDailyPnl();
+  dailyPnl += pnlUsd;
+
   currentSignal = null;
   return closed;
 }
-let lastCandleTime = 0;      // track last candle time for incremental updates
 
-// ─── Binance REST API Polling ─────────────────────────────────────────────────
+let lastCandleTime = 0;
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// DATA POLLING (Kraken REST)
+// ═══════════════════════════════════════════════════════════════════════════════
 
 let initialLoadDone = false;
 
@@ -214,19 +369,18 @@ async function fetchCandles() {
   try {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 15000);
-    
     const res = await fetch(KRAKEN_API, { signal: controller.signal });
     clearTimeout(timeout);
-    
+
     const data = await res.json();
     if (!data.result || data.error?.length > 0) {
       console.error('Kraken API error:', JSON.stringify(data.error));
       return;
     }
-    
+
     const raw = data.result.XETHZUSD;
     if (!Array.isArray(raw)) return;
-    
+
     const newCandles = raw.map(k => ({
       open: parseFloat(k[1]),
       high: parseFloat(k[2]),
@@ -235,38 +389,36 @@ async function fetchCandles() {
       volume: parseFloat(k[6]),
       time: k[0] * 1000,
     })).sort((a, b) => a.time - b.time);
-    
-    // On initial load: just populate candles, no signal checks
+
     if (!initialLoadDone) {
       candles = newCandles.slice(-MAX_CANDLES);
       lastCandleTime = candles.length > 0 ? candles[candles.length - 1].time : 0;
       initialLoadDone = true;
-      // Compute indicators for the price endpoint
       updateIndicators();
       return;
     }
-    
-    // On subsequent polls: only process candles newer than lastCandleTime
+
     const freshCandles = newCandles.filter(c => c.time > lastCandleTime);
-    
+
     for (const nc of freshCandles) {
       candles.push(nc);
       if (candles.length > MAX_CANDLES) candles.shift();
       lastCandleTime = nc.time;
-      
-      // Check for signal on each new closed candle
+
+      // Check exit on each new candle close
       const closed = updateTrailingStop(nc.close);
       if (closed && global.onSignalClose) global.onSignalClose(closed);
+
+      // Check entry if no active signal
       if (!currentSignal) {
         const signal = checkSignals();
         if (signal && global.onNewSignal) global.onNewSignal(signal);
       }
     }
-    
-    // Update indicators for price endpoint
+
     updateIndicators();
 
-    // Also update trailing on the latest price even if no new candle
+    // Also run trailing check on latest price between candles
     if (freshCandles.length === 0 && newCandles.length > 0) {
       updateTrailingStop(newCandles[newCandles.length - 1].close);
     }
@@ -280,9 +432,9 @@ async function fetchCandles() {
 }
 
 async function pollLoop() {
-  console.log('First poll starting...');
+  console.log('Loading initial candles...');
   await fetchCandles();
-  console.log('Initial candles loaded: ' + candles.length);
+  console.log('Loaded ' + candles.length + ' candles');
   while (true) {
     await new Promise(r => setTimeout(r, 30000));
     process.stdout.write('.');
@@ -290,18 +442,29 @@ async function pollLoop() {
   }
 }
 
-// ─── Callbacks ───────────────────────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════════════════════
+// CALLBACKS
+// ═══════════════════════════════════════════════════════════════════════════════
+
 global.onNewSignal = (signal) => {
   console.log(`\n🔥 ${signal.type} SIGNAL | Entry: $${signal.entry.toFixed(2)} | TP: $${signal.tp.toFixed(2)} | SL: $${signal.sl.toFixed(2)}`);
-  console.log(`   VWAP: $${signal.vwap.toFixed(2)} | Volume: ${signal.volumeRatio.toFixed(1)}x avg | Leverage: ${signal.leverage}x`);
+  console.log(`   VWAP: $${signal.vwap.toFixed(2)} | EMA: $${signal.ema.toFixed(2)} | ATR: $${signal.atr.toFixed(2)}`);
+  console.log(`   Volume: ${signal.volumeRatio.toFixed(1)}x avg | SL: ${signal.slPctUsed}% | Leverage: ${signal.leverage}x`);
+  console.log(`   Filters: Vol≥${VOLUME_MIN_RATIO}x ✓ | VWAP ✓ | EMA trend ✓`);
 };
 
 global.onSignalClose = (closed) => {
-  const emoji = closed.pnlUsd > 0 ? '✅' : '❌';
+  const emoji = parseFloat(closed.pnlUsd) > 0 ? '✅' : '❌';
   console.log(`\n${emoji} ${closed.type} CLOSED (${closed.closeReason}) | PnL: ${closed.pnlPct}% | $${closed.pnlUsd} | ${closed.durationSeconds}s`);
+  if (closed.breakevenMoved) console.log('   🛡️  SL was moved to breakeven');
+  if (closed.trailActive) console.log(`   📈 Trail was active (peak: $${closed.trailPrice?.toFixed(2)})`);
+  resetDailyPnl();
+  console.log(`   Daily PnL: $${dailyPnl.toFixed(2)} / -$${MAX_DAILY_LOSS} limit`);
 };
 
-// ─── REST API ────────────────────────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════════════════════
+// REST API
+// ═══════════════════════════════════════════════════════════════════════════════
 
 app.get('/health', (req, res) => {
   res.json({
@@ -311,10 +474,45 @@ app.get('/health', (req, res) => {
     leverage: LEVERAGE,
     tpPct: TP_PCT,
     slPct: SL_PCT,
+    trailPct: TRAIL_PCT,
+    trailBuffer: TRAIL_BUFFER,
+    bePct: BE_PCT,
+    volumeMinRatio: VOLUME_MIN_RATIO,
+    emaPeriod: EMA_PERIOD,
+    atrPeriod: ATR_PERIOD,
+    dailyPnl: dailyPnl.toFixed(2),
+    dailyLossLimit: MAX_DAILY_LOSS,
+    cooldownActive: lastCloseTime > 0 && (Date.now() - lastCloseTime) < (lastCloseWasLoss ? COOLDOWN_LOSS_MS : COOLDOWN_WIN_MS),
   });
 });
 
-// GET /v1/price — Current price + indicators
+app.get('/v1/config', (req, res) => {
+  res.json({
+    ok: true,
+    data: {
+      leverage: LEVERAGE,
+      tpPct: TP_PCT,
+      slPct: SL_PCT,
+      trailPct: TRAIL_PCT,
+      trailBuffer: TRAIL_BUFFER,
+      bePct: BE_PCT,
+      lookbackCandles: LOOKBACK_CANDLES,
+      vwapPeriods: VWAP_PERIODS,
+      emaPeriod: EMA_PERIOD,
+      atrPeriod: ATR_PERIOD,
+      atrSlMult: ATR_SL_MULT,
+      volumeMinRatio: VOLUME_MIN_RATIO,
+      cooldownLossMin: COOLDOWN_LOSS_MS / 60000,
+      cooldownWinMin: COOLDOWN_WIN_MS / 60000,
+      timeStopCandles: TIME_STOP_CANDLES,
+      maxDailyLoss: MAX_DAILY_LOSS,
+      pair: 'ETH/USD',
+      interval: '15m',
+      exchange: 'Kraken',
+    },
+  });
+});
+
 app.get('/v1/price', (req, res) => {
   if (candles.length === 0) {
     return res.json({ ok: false, error: 'No data yet. Wait for candles to load.' });
@@ -328,6 +526,8 @@ app.get('/v1/price', (req, res) => {
         ? ((last.close - candles[candles.length - 2].close) / candles[candles.length - 2].close * 100).toFixed(3)
         : '0',
       vwap: vwap.toFixed(2),
+      ema: ema.toFixed(2),
+      atr: atr.toFixed(2),
       recentHigh: recentHigh.toFixed(2),
       recentLow: recentLow === Infinity ? 'N/A' : recentLow.toFixed(2),
       volumeRatio: volumeAlert.toFixed(1),
@@ -337,7 +537,6 @@ app.get('/v1/price', (req, res) => {
   });
 });
 
-// GET /v1/signal — Current active signal or null
 app.get('/v1/signal', (req, res) => {
   if (!currentSignal) {
     return res.json({
@@ -360,40 +559,13 @@ app.get('/v1/signal', (req, res) => {
       unrealizedPnlPct: unrealizedPnl.toFixed(2),
       trailActive: currentSignal.trailActive,
       trailPrice: currentSignal.trailPrice || null,
+      breakevenMoved: currentSignal.breakevenMoved,
       secondsAgo: Math.round((Date.now() - currentSignal.time) / 1000),
+      candlesHeld: candles.length - currentSignal.entryCandleIndex,
     },
   });
 });
 
-// GET /v1/history — Signal history with PnL
-app.get('/v1/history', (req, res) => {
-  const limit = parseInt(req.query.limit) || 50;
-
-  const stats = {
-    total: signalHistory.length,
-    wins: signalHistory.filter(s => s.status === 'CLOSED' && parseFloat(s.pnlUsd) > 0).length,
-    losses: signalHistory.filter(s => s.status === 'CLOSED' && parseFloat(s.pnlUsd) <= 0).length,
-    totalPnl: signalHistory
-      .filter(s => s.pnlUsd)
-      .reduce((s, sig) => s + parseFloat(sig.pnlUsd), 0).toFixed(2),
-    avgWin: signalHistory.filter(s => parseFloat(s.pnlUsd) > 0).length > 0
-      ? (signalHistory.filter(s => parseFloat(s.pnlUsd) > 0).reduce((s, sig) => s + parseFloat(sig.pnlUsd), 0) /
-         signalHistory.filter(s => parseFloat(s.pnlUsd) > 0).length).toFixed(2)
-      : '0',
-    winRate: signalHistory.filter(s => s.status === 'CLOSED').length > 0
-      ? (signalHistory.filter(s => s.status === 'CLOSED' && parseFloat(s.pnlUsd) > 0).length /
-         signalHistory.filter(s => s.status === 'CLOSED').length * 100).toFixed(1)
-      : '0',
-  };
-
-  res.json({
-    ok: true,
-    data: signalHistory.slice(-limit),
-    stats,
-  });
-});
-
-// GET /v1/avantis-execute — Prepared execution plan for Base MCP
 app.get('/v1/avantis-execute', (req, res) => {
   if (!currentSignal) {
     return res.json({ ok: false, error: 'No active signal', message: 'Wait for a breakout signal.' });
@@ -416,16 +588,18 @@ app.get('/v1/avantis-execute', (req, res) => {
       takeProfit: currentSignal.tp,
       stopLoss: currentSignal.sl,
       trailActive: currentSignal.trailActive,
-      riskReward: `${((TP_PCT / SL_PCT)).toFixed(1)}:1`,
-      // Agent prompt for Base MCP
+      breakevenMoved: currentSignal.breakevenMoved,
+      riskReward: `${(TP_PCT / parseFloat(currentSignal.slPctUsed || (currentSignal.sl / currentSignal.entry * 100))).toFixed(1)}:1`,
       agentPrompt: isLong
-        ? `Open ${LEVERAGE}x LONG ETH/USDC on Avantis via Base MCP. Entry: $${currentSignal.entry.toFixed(2)}. TP: $${currentSignal.tp.toFixed(2)} (+${(TP_PCT*100).toFixed(1)}%). SL: $${currentSignal.sl.toFixed(2)} (-${(SL_PCT*100).toFixed(1)}%). Margin: $1000. Position size: $${1000 * LEVERAGE}. Trailing stop activates at +${(TRAIL_PCT*100).toFixed(1)}%.`
-        : `Open ${LEVERAGE}x SHORT ETH/USDC on Avantis via Base MCP. Entry: $${currentSignal.entry.toFixed(2)}. TP: $${currentSignal.tp.toFixed(2)} (+${(TP_PCT*100).toFixed(1)}%). SL: $${currentSignal.sl.toFixed(2)} (-${(SL_PCT*100).toFixed(1)}%). Margin: $1000. Position size: $${1000 * LEVERAGE}. Trailing stop activates at +${(TRAIL_PCT*100).toFixed(1)}%.`,
+        ? `Open ${LEVERAGE}x LONG ETH/USDC on Avantis via Base MCP. Entry: $${currentSignal.entry.toFixed(2)}. TP: $${currentSignal.tp.toFixed(2)} (+${(TP_PCT*100).toFixed(1)}%). SL: $${currentSignal.sl.toFixed(2)}. Margin: $1000. Position size: $${1000 * LEVERAGE}. Trailing stop activates at +${(TRAIL_PCT*100).toFixed(1)}%. SL moves to breakeven at +${(BE_PCT*100).toFixed(1)}%.`
+        : `Open ${LEVERAGE}x SHORT ETH/USDC on Avantis via Base MCP. Entry: $${currentSignal.entry.toFixed(2)}. TP: $${currentSignal.tp.toFixed(2)} (+${(TP_PCT*100).toFixed(1)}%). SL: $${currentSignal.sl.toFixed(2)}. Margin: $1000. Position size: $${1000 * LEVERAGE}. Trailing stop activates at +${(TRAIL_PCT*100).toFixed(1)}%. SL moves to breakeven at +${(BE_PCT*100).toFixed(1)}%.`,
       config: {
         leverage: LEVERAGE,
         tpPct: TP_PCT,
         slPct: SL_PCT,
         trailPct: TRAIL_PCT,
+        trailBuffer: TRAIL_BUFFER,
+        bePct: BE_PCT,
         pair: 'ETH/USDC',
         chain: 'Base (8453)',
         protocol: 'Avantis',
@@ -434,19 +608,79 @@ app.get('/v1/avantis-execute', (req, res) => {
   });
 });
 
-// ─── Start ───────────────────────────────────────────────────────────────────
+app.get('/v1/history', (req, res) => {
+  const limit = parseInt(req.query.limit) || 50;
+  const closedTrades = signalHistory.filter(s => s.status === 'CLOSED');
+  const wins  = closedTrades.filter(s => parseFloat(s.pnlUsd) > 0);
+  const losses = closedTrades.filter(s => parseFloat(s.pnlUsd) <= 0);
+
+  const totalPnl = closedTrades.reduce((s, sig) => s + parseFloat(sig.pnlUsd), 0);
+  const avgWin  = wins.length > 0
+    ? wins.reduce((s, sig) => s + parseFloat(sig.pnlUsd), 0) / wins.length
+    : 0;
+  const avgLoss = losses.length > 0
+    ? losses.reduce((s, sig) => s + parseFloat(sig.pnlUsd), 0) / losses.length
+    : 0;
+  const winRate = closedTrades.length > 0
+    ? (wins.length / closedTrades.length * 100)
+    : 0;
+  const grossProfit = wins.reduce((s, sig) => s + parseFloat(sig.pnlUsd), 0);
+  const grossLoss   = Math.abs(losses.reduce((s, sig) => s + parseFloat(sig.pnlUsd), 0));
+  const profitFactor = grossLoss > 0 ? (grossProfit / grossLoss) : (grossProfit > 0 ? Infinity : 0);
+  const largestWin  = wins.length > 0 ? Math.max(...wins.map(s => parseFloat(s.pnlUsd))) : 0;
+  const largestLoss = losses.length > 0 ? Math.min(...losses.map(s => parseFloat(s.pnlUsd))) : 0;
+
+  const stats = {
+    total: signalHistory.length,
+    closed: closedTrades.length,
+    active: signalHistory.filter(s => s.status === 'ACTIVE').length,
+    wins: wins.length,
+    losses: losses.length,
+    totalPnl: totalPnl.toFixed(2),
+    avgWin: avgWin.toFixed(2),
+    avgLoss: avgLoss.toFixed(2),
+    winRate: winRate.toFixed(1),
+    profitFactor: profitFactor === Infinity ? '∞' : profitFactor.toFixed(2),
+    largestWin: largestWin.toFixed(2),
+    largestLoss: largestLoss.toFixed(2),
+    expectancy: closedTrades.length > 0
+      ? ((winRate / 100 * avgWin) - ((1 - winRate / 100) * Math.abs(avgLoss))).toFixed(2)
+      : '0',
+    dailyPnl: dailyPnl.toFixed(2),
+    dailyLossLimit: MAX_DAILY_LOSS,
+  };
+
+  res.json({
+    ok: true,
+    data: signalHistory.slice(-limit),
+    stats,
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// START
+// ═══════════════════════════════════════════════════════════════════════════════
+
 const PORT = process.env.PORT || 3002;
 app.listen(PORT, () => {
-  console.log(`Scalp Base MCP running on port ${PORT}`);
-  console.log(`Strategy: Momentum breakout | 15m candles | ${LEVERAGE}x leverage | TP: +${(TP_PCT*100).toFixed(1)}% | SL: -${(SL_PCT*100).toFixed(1)}%`);
-  console.log(`Trailing stop: activates after +${(TRAIL_PCT*100).toFixed(1)}%`);
-  console.log(`Backtest: 10 months, 11/11 profitable months, 59% WR, +$38K on $1K`);
+  console.log(`╔══════════════════════════════════════════════════════════════╗`);
+  console.log(`║  SCALP BASE MCP  v2.0  —  HONED EDITION                     ║`);
+  console.log(`╠══════════════════════════════════════════════════════════════╣`);
+  console.log(`║  Port:     ${PORT}                                               ║`);
+  console.log(`║  Pair:     ETH/USD  |  15m candles  |  ${LEVERAGE}x leverage          ║`);
+  console.log(`║  TP:       +${(TP_PCT*100).toFixed(1)}%   |  SL: ${(SL_PCT*100).toFixed(1)}% (min)    |  ATR SL: ${ATR_SL_MULT}x ATR    ║`);
+  console.log(`║  Trail:    +${(TRAIL_PCT*100).toFixed(1)}%  |  Bfr: ${(TRAIL_BUFFER*100).toFixed(1)}%     |  BE: +${(BE_PCT*100).toFixed(1)}%           ║`);
+  console.log(`║  Vol min:  ${VOLUME_MIN_RATIO}x avg  |  EMA: ${EMA_PERIOD}      |  Cooldown: ${COOLDOWN_LOSS_MS/60000}m/${COOLDOWN_WIN_MS/60000}m      ║`);
+  console.log(`║  TimeStop: ${TIME_STOP_CANDLES}candles |  Daily lim: $${MAX_DAILY_LOSS}   |  ATR: ${ATR_PERIOD} candles       ║`);
+  console.log(`╚══════════════════════════════════════════════════════════════╝`);
   console.log('');
   console.log('Endpoints:');
-  console.log('  GET /v1/price            — Live ETH price + indicators');
-  console.log('  GET /v1/signal           — Active scalping signal');
-  console.log('  GET /v1/avantis-execute  — Avantis execution plan');
-  console.log('  GET /v1/history          — Signal PnL history');
+  console.log('  GET /health             — Status + config summary');
+  console.log('  GET /v1/config          — Full strategy parameters');
+  console.log('  GET /v1/price           — Live price + indicators (VWAP, EMA, ATR)');
+  console.log('  GET /v1/signal          — Active signal or null');
+  console.log('  GET /v1/avantis-execute — Avantis execution plan');
+  console.log('  GET /v1/history         — Trade history + stats (PF, expectancy, etc.)');
   console.log('');
   console.log('Polling Kraken API (15m candles, 30s intervals)...');
   pollLoop();

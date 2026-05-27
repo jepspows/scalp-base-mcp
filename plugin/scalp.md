@@ -9,34 +9,41 @@
 >
 > The user's wallet address is confirmed during Detection.
 
-**Scalp MCP** is a real-time ETH momentum breakout scalper. It connects to Binance WebSocket for 1-minute candles, calculates VWAP + recent high/low levels, and generates LONG/SHORT signals when price breaks key levels. The agent executes via Avantis perps through Base MCP.
+**Scalp MCP v2** is a real-time ETH momentum breakout scalper with multi-filter signal engine. Polls Kraken REST for 15-minute candles, calculates VWAP + EMA trend + ATR volatility + volume profile, and generates LONG/SHORT signals only when ALL filters align. The agent executes via Avantis perps through Base MCP.
 
-**Strategy**: Momentum breakout on 1m candles with trailing stop.
+**Strategy**: Filtered momentum breakout on 15m candles with trailing stop, breakeven move, and risk circuit breakers.
 
-**Server**: Self-hosted (port 3002). WebSocket connection to Binance requires outbound internet.
+**Server**: Self-hosted (port 3002). Polls Kraken REST API every 30s.
 
 ---
 
-## Strategy Parameters
+## Strategy Parameters (v2 Honed)
 
 | Parameter | Value | Description |
 |-----------|-------|-------------|
-| Timeframe | 15m candles | 4h for full VWAP warmup |
-| Leverage | 10x | $10,000 positions on $1,000 |
-| Take Profit | +2.0% | +$200 per win |
-| Stop Loss | -0.5% | -$50 per loss |
-| Trailing Stop | Activates at +0.3% | Locks in runners |
+| Timeframe | 15m candles | Kraken ETH/USD |
+| Leverage | 10x | $10,000 positions on $1,000 margin |
+| Take Profit | +2.5% | +$250 per full win |
+| Stop Loss (base) | -0.8% | Dynamic: max(0.8%, 1.5× ATR) |
+| Trailing Stop | Activates at +1.2% | Locks runners with 0.4% buffer |
+| Breakeven | SL→entry at +1.0% | Risk-free after small move |
 | Lookback | 5 candles | Breakout from recent 5-bar high/low |
 | VWAP Period | 15 candles | Volume-weighted average price |
+| EMA Trend | 20-period | LONG only above EMA20, SHORT only below |
+| ATR Period | 14 candles | Dynamic stop floor = 1.5× ATR |
+| Volume Filter | ≥1.3× average | Skip low-volume fakeouts |
+| Cooldown | 45m loss / 15m win | No revenge entries |
+| Time Stop | 12 candles (3h) | Kill stale unresolved trades |
+| Daily Loss Limit | -$300 | Circuit breaker for the day |
 
-**Risk/Reward**: 4:1 (2.0% TP vs 0.5% SL)
+**Risk/Reward**: ~3:1 effective (2.5% TP vs 0.8% SL floor, tightened by trail/breakeven)
 
-**Backtest**: 10 months (Aug 2025–May 2026), 28,801 candles
-- Total PnL: +$38,197 on $1,000 capital (3,820% ROI)
-- Win rate: 59%
-- 11/11 profitable months
-- Max drawdown: $766
-- ~10 trades/day
+**Key v1→v2 fixes:**
+- Trail used to activate at +0.3% with 0.1% buffer → choked winners at $27 avg
+- No volume filter → took low-volume fakeouts
+- No trend filter → traded against momentum
+- No cooldown → revenge entries after losses
+- Fixed 0.5% SL → wicked out on ETH volatility
 
 ---
 
@@ -134,19 +141,30 @@ Response includes `stats` object with win rate, total PnL, avg win/loss.
 ## Signal Logic (when the agent should act)
 
 ### LONG entry conditions (ALL must be true):
-1. Current 1m candle close > recent 5-candle high
+1. Current 15m candle close > recent 5-candle high (breakout)
 2. Previous candle close ≤ recent 5-candle high (breakout just happened)
-3. Price > VWAP (uptrend confirmation)
+3. Price > VWAP (volume-weighted uptrend confirmation)
+4. Price > EMA20 (trend filter — only trade with momentum)
+5. Volume ≥ 1.3× 20-candle average (elevated volume breakout)
+6. Cooldown elapsed (45 min after loss, 15 min after win)
+7. Daily PnL > -$300 (circuit breaker)
 
 ### SHORT entry conditions (ALL must be true):
-1. Current 1m candle close < recent 5-candle low
+1. Current 15m candle close < recent 5-candle low (breakdown)
 2. Previous candle close ≥ recent 5-candle low
 3. Price < VWAP (downtrend confirmation)
+4. Price < EMA20 (trend filter)
+5. Volume ≥ 1.3× 20-candle average
+6. Cooldown elapsed
+7. Daily PnL > -$300
 
 ### Exit conditions:
-- TP hit → close position, take profit
-- SL hit → close position, take loss
-- Trailing stop: activates after 0.3% profit, trails 0.1% behind price
+- TP hit (+2.5%) → close position, take profit
+- SL hit (-0.8% or 1.5× ATR, whichever is wider) → close position, take loss
+- SL moves to breakeven after +1.0% profit (risk-free from that point)
+- Trailing stop activates after +1.2% profit, trails 0.4% behind peak
+- Time stop: exit after 12 candles (3 hours) if neither TP nor SL hit
+- Daily loss limit: no new signals after -$300 daily PnL
 
 ---
 
@@ -202,8 +220,10 @@ Base MCP prepares the Avantis perp open via its native plugin.
 ## Notes
 
 - **10x is chosen deliberately**: 500x = instant liquidation. 10x survives 5% ETH swings.
-- **Trailing stops win**: Most profits come from runners that hit trail, not fixed TP.
-- **Volume filter**: Low volume breakouts are noise. The VWAP confirmation filters fakeouts.
-- **This is NOT HFT**: Signals fire on 1m candle closes. You have ~60 seconds to execute.
+- **Trailing stops win**: After +1.2% profit the trail kicks in with 0.4% buffer — wide enough to ride pullbacks, tight enough to lock gains.
+- **Volume filter is critical**: Low-volume breakouts on 15m candles are usually fakeouts. Requiring 1.3× avg volume eliminates most false signals.
+- **EMA trend filter**: Prevents counter-trend entries. The worst losses come from fading the dominant 15m trend.
+- **Breakeven move**: Once a trade is +1.0% in profit, SL jumps to entry — worst case is scratch, best case is runner.
+- **This is NOT HFT**: Signals fire on 15m candle closes via Kraken REST. You have ~30-60 seconds to execute.
 - **Gas is irrelevant**: $0.01-0.02 on Base L2. Position size $10K makes gas negligible.
-- **24/7 operation**: Crypto never closes. Run this on Render for continuous monitoring.
+- **24/7 operation**: Crypto never closes. Run this on Render or VPS for continuous monitoring.
